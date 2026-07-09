@@ -1,0 +1,11 @@
+{
+    "username": "你的手机号",
+    "password": "你的密码",
+    "course_name": "课程名称关键词（支持模糊匹配）",
+    "course_url": "",
+    "location": {
+        "address": "某某大学 教学楼101",
+        "latitude": "30.123456",
+        "longitude": "120.123456"
+    }
+}
