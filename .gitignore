@@ -11,3 +11,6 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+#debug
+debug_output/

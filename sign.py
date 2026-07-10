@@ -37,11 +37,12 @@ AES_IV = b"u2oh6Vu^HWe4_AES"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 10; SM-G9730 Build/QP1A.190711.020; wv) "
+        "Mozilla/5.0 (Linux; Android 13; zh-CN) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
-        "Chrome/92.0.4515.105 Mobile Safari/537.36 "
-        "com.ss.android.article.news/2010 (Senior University Union)"
+        "Chrome/100.0.4896.127 Mobile Safari/537.36 "
+        "com.chaoxing.mobile/ChaoXingStudy_3_6.3.3_android_phone"
     ),
+    "X-Requested-With": "com.chaoxing.mobile",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
@@ -383,14 +384,50 @@ class ChaoxingSign:
 
     # ── 4. 获取签到活动 ────────────────────────────────
 
+    # 备选活动检测 API（taskactivelist 只覆盖课堂活动，不覆盖任务签到）
+    _ALT_ACTIVITY_APIS = [
+        # v2 API — 可能包含任务签到
+        "https://mobilelearn.chaoxing.com/v2/apis/active/getActiveList",
+        # getactivelist (小写) — 另一种路径
+        "https://mobilelearn.chaoxing.com/ppt/activeAPI/getactivelist",
+    ]
+
     def get_active_signs(self, course: dict) -> list[dict]:
-        """获取课程中未完成的签到活动"""
+        """获取课程中未完成的签到活动（多 API 源 + 页面解析）"""
         print("[3/4] 正在检测签到活动...")
 
         course_id = course["courseId"]
         class_id = course["classId"]
 
-        url = "https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist"
+        # ── 方法 1：主 API — 课堂活动 ──
+        pending = self._fetch_active_signs_from_api(
+            "https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist",
+            course_id, class_id,
+        )
+        if pending:
+            return pending
+
+        # ── 方法 2：备选 API — 可能包含任务签到 ──
+        for alt_url in self._ALT_ACTIVITY_APIS:
+            pending = self._fetch_active_signs_from_api(
+                alt_url, course_id, class_id,
+            )
+            if pending:
+                return pending
+
+        # ── 方法 3：课程页面 HTML 解析 — 提取嵌入式任务签到数据 ──
+        print(f"  API 均未返回签到，尝试从课程页面解析...")
+        pending = self._detect_signs_from_course_page(course_id, class_id)
+        if pending:
+            return pending
+
+        print(f"  {OK}当前课程没有未完成的签到活动")
+        return []
+
+    def _fetch_active_signs_from_api(
+        self, url: str, course_id: str, class_id: str,
+    ) -> list[dict]:
+        """调用单个活动列表 API 并提取待签到活动"""
         params = {
             "courseId": course_id,
             "classId": class_id,
@@ -401,28 +438,168 @@ class ChaoxingSign:
             resp = self.session.get(url, params=params, timeout=15)
             resp.raise_for_status()
             data = resp.json()
-        except requests.RequestException as e:
-            print(f"  {FAIL} 获取签到活动失败: {e}")
+        except requests.RequestException:
             return []
         except json.JSONDecodeError:
-            print("  {FAIL} 签到活动接口返回格式异常")
             return []
 
         active_list = data.get("activeList", [])
         if not active_list:
             active_list = data.get("data", [])
+        if not active_list:
+            # 有些接口直接返回数组
+            if isinstance(data, list):
+                active_list = data
 
-        # 筛选：activeType=2（签到活动）且 status=1（未签到）
+        if not active_list:
+            return []
+
+        # 调试：打印所有活动的关键字段
+        print(f"  [{url.split('/')[-1]}] 返回 {len(active_list)} 个活动:")
+        for item in active_list:
+            at = item.get("activeType", "?")
+            oid = item.get("otherId", "?")
+            st = item.get("status", "?")
+            n1 = item.get("nameOne", "?")
+            print(f"    - [{n1}] activeType={at}, otherId={oid}, status={st}")
+
+        return self._filter_pending_signs(active_list)
+
+    def _detect_signs_from_course_page(
+        self, course_id: str, class_id: str,
+    ) -> list[dict]:
+        """从课程相关页面 HTML 中提取任务签到数据"""
+        # 尝试多个可能的页面 URL — 覆盖门户页、任务页、互动页
+        page_urls = [
+            # 课程门户页
+            f"https://mooc1-1.chaoxing.com/course-ans/courseportal/{course_id}.html",
+            f"https://mooc1.chaoxing.com/course-ans/courseportal/{course_id}.html",
+            # 课程互动页（任务通常在此）
+            f"https://mooc1-1.chaoxing.com/mooc-ans/course/interaction",
+            # 活动/任务列表页
+            f"https://mooc1-1.chaoxing.com/course-ans/ps/{course_id}",
+            f"https://mooc1-1.chaoxing.com/mooc-ans/course/task",
+        ]
+        params = {
+            "courseId": course_id,
+            "clazzid": class_id,
+            "classId": class_id,
+        }
+
+        html = ""
+        used_url = ""
+        for page_url in page_urls:
+            try:
+                resp = self.session.get(
+                    page_url, params=params, timeout=15, allow_redirects=True,
+                )
+                if resp.ok and len(resp.text) > 500:
+                    html = resp.text
+                    used_url = str(resp.url)  # 记录最终重定向后的 URL
+                    print(f"  页面获取成功: {page_url} -> {used_url} ({len(html)} 字节)")
+                    break
+            except requests.RequestException:
+                continue
+
+        if not html:
+            return []
+
+        # ── 诊断：保存页面 HTML 的第一部分供分析 ──
+        self._save_debug_html(html, used_url, course_id)
+
+        # 从 HTML 中提取可能的签到活动数据
+        candidates: list[dict] = []
+
+        # 模式 1：JavaScript 对象中的 activeId / activePrimaryId
+        for m in re.finditer(
+            r'"active(?:Primary)?Id"\s*:\s*"?(\d+)"?', html,
+        ):
+            candidates.append({"activeId": m.group(1), "name": "页面检测签到", "source": "html-js"})
+
+        # 模式 2：URL 参数中的 activeId
+        for m in re.finditer(
+            r'activeId[=:](\d+)', html, re.IGNORECASE,
+        ):
+            candidates.append({"activeId": m.group(1), "name": "页面检测签到", "source": "html-url"})
+
+        # 模式 3：JSON 块中的活动数据（activeType + status）
+        for m in re.finditer(
+            r'\{(?:[^{}]*)["\']activeType["\']\s*:\s*(\d+)(?:[^{}]*)\}',
+            html, re.DOTALL,
+        ):
+            block = m.group(0)
+            at = int(extract(r'"activeType"\s*:\s*(\d+)', block) or "0")
+            st = int(extract(r'"status"\s*:\s*(\d+)', block) or "0")
+            oid_str = extract(r'"otherId"\s*:\s*(\d+)', block)
+            oid = int(oid_str) if oid_str else None
+
+            is_signin = (at == 2) or (oid is not None and oid in [0, 2, 3, 4, 5])
+            if is_signin and st == 1:
+                aid = (
+                    extract(r'"activePrimaryId"\s*:\s*"?(\d+)"?', block)
+                    or extract(r'"activeId"\s*:\s*"?(\d+)"?', block)
+                    or extract(r'"id"\s*:\s*"?(\d+)"?', block)
+                )
+                if aid:
+                    name = extract(r'"nameOne"\s*:\s*"([^"]*)"', block) or "页面检测签到"
+                    candidates.append({"activeId": aid, "name": name, "source": "html-json"})
+
+        if candidates:
+            print(f"  页面解析发现 {len(candidates)} 个候选签到:")
+            for c in candidates:
+                print(f"    - [{c['name']}] activeId={c['activeId']} (来源: {c['source']})")
+
+        # 去重后返回
+        seen: set[str] = set()
+        result: list[dict] = []
+        for c in candidates:
+            if c["activeId"] not in seen:
+                seen.add(c["activeId"])
+                result.append({
+                    "activeId": c["activeId"],
+                    "name": c.get("name", "未知活动"),
+                    "courseName": "",
+                    "statusText": "",
+                })
+        return result
+
+    def _save_debug_html(
+        self, html: str, url: str, course_id: str,
+    ) -> None:
+        """保存诊断用的 HTML 片段，方便分析页面结构"""
+        import os as _os
+        debug_dir = Path(__file__).resolve().parent / "debug_output"
+        try:
+            debug_dir.mkdir(exist_ok=True)
+            # 保存前 5000 字符（含关键 JS 变量）
+            snippet = html[:5000]
+            fname = debug_dir / f"course_{course_id}_page.txt"
+            fname.write_text(
+                f"URL: {url}\nLength: {len(html)}\n\n{snippet}",
+                encoding="utf-8",
+            )
+            print(f"  诊断文件已保存: {fname}")
+        except OSError:
+            pass  # 静默失败，不影响主流程
+
+    def _filter_pending_signs(self, active_list: list) -> list[dict]:
+        """从活动列表中筛选待签到项"""
         pending = []
         for item in active_list:
-            if item.get("activeType") == 2 and item.get("status") == 1:
-                # 从 url 中提取 activeId
-                active_id = ""
-                url_str = item.get("url", "")
-                if url_str:
-                    active_id = extract(r"activeId=(\d+)", url_str)
+            is_signin = (
+                item.get("activeType") == 2
+                or item.get("otherId") in [0, 2, 3, 4, 5]
+            )
+            is_pending = item.get("status") == 1
+
+            if is_signin and is_pending:
+                active_id = self._extract_active_id(item)
                 if not active_id:
-                    active_id = unquote(extract(r"activeId%3D(\d+)", url_str))
+                    print(
+                        f"  {WARN} 无法提取签到ID，跳过: "
+                        f"{item.get('nameOne', '未知')}"
+                    )
+                    continue
 
                 pending.append({
                     "activeId": active_id,
@@ -432,6 +609,34 @@ class ChaoxingSign:
                 })
 
         return pending
+
+    @staticmethod
+    def _extract_active_id(item: dict) -> str:
+        """从活动数据中提取 activeId，按优先级依次尝试多种字段"""
+        # 1. 直接字段
+        for field in ("activePrimaryId", "activeId", "id", "aid"):
+            val = item.get(field, "")
+            if val:
+                return str(val)
+
+        # 2. 从 url 字段中正则提取
+        url_str = item.get("url", "")
+        if url_str:
+            aid = extract(r"activeId=(\d+)", url_str)
+            if aid:
+                return aid
+            aid = unquote(extract(r"activeId%3D(\d+)", url_str))
+            if aid:
+                return aid
+
+        # 3. 从 appUrl 字段提取
+        app_url = item.get("appUrl", "")
+        if app_url:
+            aid = extract(r"activeId=(\d+)", app_url)
+            if aid:
+                return aid
+
+        return ""
 
     # ── 5. 提交位置签到 ────────────────────────────────
 
@@ -543,7 +748,6 @@ class ChaoxingSign:
         # 3. 检测签到活动
         pending_signs = self.get_active_signs(course)
         if not pending_signs:
-            print(f"  {OK}当前课程没有未完成的签到活动")
             print(f"\n  当前课程: {course['name']}")
             print(f"  课程ID: {course['courseId']}, 班级ID: {course.get('classId', 'N/A')}")
 
@@ -553,7 +757,9 @@ class ChaoxingSign:
                 print(f"\n  {OK}测试完成：登录、课程获取、活动检测均正常。")
                 print(f"  签到接口连通性已验证。")
             else:
-                print(f"  请确认老师已经发起了签到再运行此脚本。")
+                print(f"  请确认老师已经发起了签到再运行此脚本。\n")
+                print(f"  提示：若签到在课程「任务」板块中发布，")
+                print(f"        请将课程页面完整保存为 HTML 后提供给开发者分析。")
             return
 
         print(f"  {OK}发现 {len(pending_signs)} 个待签到活动:")
@@ -583,30 +789,44 @@ class ChaoxingSign:
         print("=" * 50)
 
     def _test_sign_endpoint(self, course: dict) -> None:
-        """测试签到接口是否可达"""
+        """测试各签到检测接口是否可达"""
         print(f"\n  --- 连通性测试 ---")
-        test_url = "https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist"
-        try:
-            r = self.session.get(test_url, params={
-                "courseId": course["courseId"],
-                "classId": course.get("classId", "0"),
-                "uid": self.uid,
-            }, timeout=10)
-            print(f"  签到活动接口: HTTP {r.status_code} (连通)")
-        except requests.RequestException as e:
-            print(f"  签到活动接口: 不可达 ({e})")
+        cid = course["courseId"]
+        clid = course.get("classId", "0")
 
-        test_url2 = "https://mobilelearn.chaoxing.com/pptSign/stuSignajax"
+        # 主 API
+        for label, url in [
+            ("主API (taskactivelist)",
+             "https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist"),
+            ("备选API (v2/getActiveList)",
+             "https://mobilelearn.chaoxing.com/v2/apis/active/getActiveList"),
+            ("课程页面",
+             f"https://mooc1-1.chaoxing.com/course-ans/courseportal/{cid}.html"),
+        ]:
+            try:
+                r = self.session.get(url, params={
+                    "courseId": cid,
+                    "classId": clid,
+                    "uid": self.uid,
+                }, timeout=10)
+                print(f"  {label}: HTTP {r.status_code} (连通)")
+            except requests.RequestException as e:
+                print(f"  {label}: 不可达 ({e})")
+
+        # 签到提交接口
         try:
-            r = self.session.get(test_url2, params={
-                "activeId": "0",
-                "uid": self.uid,
-                "clientip": "",
-                "latitude": self.latitude,
-                "longitude": self.longitude,
-                "appType": "15",
-                "fid": "0",
-            }, timeout=10)
+            r = self.session.get(
+                "https://mobilelearn.chaoxing.com/pptSign/stuSignajax",
+                params={
+                    "activeId": "0",
+                    "uid": self.uid,
+                    "clientip": "",
+                    "latitude": self.latitude,
+                    "longitude": self.longitude,
+                    "appType": "15",
+                    "fid": "0",
+                }, timeout=10,
+            )
             print(f"  签到提交接口: HTTP {r.status_code} (连通, 返回: {r.text[:50]})")
         except requests.RequestException as e:
             print(f"  签到提交接口: 不可达 ({e})")
